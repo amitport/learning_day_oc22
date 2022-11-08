@@ -1,3 +1,5 @@
+from math import sqrt
+
 import torch
 from torch import nn
 from torch.utils.data import DataLoader, Dataset
@@ -20,15 +22,14 @@ class DatasetSplit(Dataset):
 
 
 class LocalUpdate(object):
-    def __init__(self, device, local_batch_size, lr, local_ep, dataset, idxs, logger, verbose=False):
+    def __init__(self, device, local_batch_size, local_ep, dataset, idxs, logger, verbose=False):
         self.logger = logger
         self.device = device
         self.local_batch_size = local_batch_size
-        self.lr = lr
         self.local_ep = local_ep
         self.verbose = verbose
 
-        self.trainloader, self.validloader, self.testloader = self.train_val_test(
+        self.trainloader, self.validloader = self.train_val_test(
             dataset, list(idxs))
         # Default criterion set to NLL loss function
         self.criterion = nn.NLLLoss().to(self.device)
@@ -39,28 +40,44 @@ class LocalUpdate(object):
         and user indexes.
         """
         # split indexes for train, validation, and test (80, 10, 10)
-        idxs_train = idxs[:int(0.8*len(idxs))]
-        idxs_val = idxs[int(0.8*len(idxs)):int(0.9*len(idxs))]
-        idxs_test = idxs[int(0.9*len(idxs)):]
+        idxs_train = idxs[:int(0.9*len(idxs))]
+        idxs_val = idxs[int(0.9*len(idxs)):]
 
         trainloader = DataLoader(DatasetSplit(dataset, idxs_train),
                                  batch_size=self.local_batch_size, shuffle=True)
         validloader = DataLoader(DatasetSplit(dataset, idxs_val),
                                  batch_size=max(int(len(idxs_val)/10), 1), shuffle=False)
-        testloader = DataLoader(DatasetSplit(dataset, idxs_test),
-                                batch_size=max(int(len(idxs_test)/10), 1), shuffle=False)
-        return trainloader, validloader, testloader
+        return trainloader, validloader
 
-    def update_weights(self, model):
+    def update_weights(self, model, global_epoch, mu=0.01):
         # Set mode to train model
+        global_parameters = [_.detach().clone() for _ in model.parameters()]
         model.train()
         epoch_loss = []
-
+        lr = 1 / sqrt(10000 * (global_epoch + 1))
         # Set optimizer for the local updates
-        optimizer = torch.optim.SGD(model.parameters(), lr=self.lr,
+        optimizer = torch.optim.SGD(model.parameters(), lr=lr,
                                         momentum=0.5)
 
-        raise NotImplementedError()
+        for iter in range(self.local_ep):
+            batch_loss = []
+            for batch_idx, (images, labels) in enumerate(self.trainloader):
+                images, labels = images.to(self.device), labels.to(self.device)
+
+                model.zero_grad()
+                log_probs = model(images)
+
+                proximal_term = torch.tensor(0.0).to(global_parameters[0].device)
+                for w, w_t in zip(model.parameters(), global_parameters):
+                    proximal_term += (w - w_t).norm(2)
+
+                loss = self.criterion(log_probs, labels) + proximal_term * mu / 2
+                loss.backward()
+                optimizer.step()
+
+                self.logger.add_scalar('loss', loss.item())
+                batch_loss.append(loss.item())
+            epoch_loss.append(sum(batch_loss)/len(batch_loss))
 
         return model.state_dict(), sum(epoch_loss) / len(epoch_loss)
 
@@ -71,7 +88,7 @@ class LocalUpdate(object):
         model.eval()
         loss, total, correct = 0.0, 0.0, 0.0
 
-        for batch_idx, (images, labels) in enumerate(self.testloader):
+        for batch_idx, (images, labels) in enumerate(self.validloader):
             images, labels = images.to(self.device), labels.to(self.device)
 
             # Inference
